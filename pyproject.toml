@@ -1,0 +1,20 @@
+[project]
+name = "querymind"
+version = "0.1.0"
+description = "Search scraping and LLM interface toolkit with FastAPI."
+authors = [{ name="Adarsh Crypto", email="your_email@example.com" }]
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "fastapi",
+    "aiohttp",
+    "beautifulsoup4",
+    "cachetools",
+    "ratelimit",
+    "uvicorn"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
