@@ -1,0 +1,19 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "querymind-api",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-03-27",
+  "compatibility_flags": ["global_fetch_strictly_public"],
+  "vars": {
+    "OLLAMA_BASE_URL": "https://ollama.com/api",
+    "OLLAMA_MODEL": "glm-5",
+    "SEARXNG_DISCOVERY_URL": "https://searx.space/data/instances.json",
+    "SEARXNG_ENABLE_FALLBACK_ROTATION": "true",
+    "SEARXNG_LANGUAGE": "en",
+    "SEARXNG_SAFESEARCH": "1",
+    "SEARCH_RESULT_LIMIT": "5",
+    "SEARXNG_DISCOVERY_CANDIDATE_LIMIT": "8",
+    "SEARXNG_DISCOVERY_MAX_ATTEMPTS": "4",
+    "SEARXNG_EMPTY_RESULT_RETRIES": "1"
+  }
+}
