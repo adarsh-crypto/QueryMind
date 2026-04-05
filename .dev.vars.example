@@ -11,4 +11,11 @@ SEARXNG_CATEGORIES=general
 SEARXNG_TIME_RANGE=
 OLLAMA_BASE_URL=https://ollama.com/api
 OLLAMA_MODEL=glm-5
+OLLAMA_PLAN=free
 OLLAMA_API_KEY=replace-me
+# Optional local estimate budgets for the usage panel.
+# Ollama does not publish exact remaining quota in the public API, so these are manual estimates if you know them.
+# OLLAMA_ESTIMATED_SESSION_TOKEN_BUDGET=250000
+# OLLAMA_ESTIMATED_WEEKLY_TOKEN_BUDGET=1500000
+# OLLAMA_ESTIMATED_SESSION_RUNTIME_BUDGET_NS=900000000000
+# OLLAMA_ESTIMATED_WEEKLY_RUNTIME_BUDGET_NS=6000000000000

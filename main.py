@@ -1,11 +1,12 @@
 import hashlib
 import logging
 import os
-from typing import Any
+from typing import Any, AsyncIterator
 
 import aiohttp
 from cachetools import TTLCache
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 
@@ -71,6 +72,15 @@ class ChatRequest(BaseModel):
 
 def build_timeout() -> aiohttp.ClientTimeout:
     return aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+
+
+def build_streaming_timeout() -> aiohttp.ClientTimeout:
+    return aiohttp.ClientTimeout(
+        total=None,
+        connect=HTTP_TIMEOUT_SECONDS,
+        sock_connect=HTTP_TIMEOUT_SECONDS,
+        sock_read=None,
+    )
 
 
 def dump_model(model: BaseModel) -> dict[str, Any]:
@@ -346,6 +356,30 @@ def resolve_messages(chat_request: ChatRequest) -> list[dict[str, str]]:
     return [{"role": "user", "content": query}]
 
 
+def build_chat_messages(
+    chat_request: ChatRequest,
+    base_messages: list[dict[str, str]],
+    search_results: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    messages = [
+        {
+            "role": "system",
+            "content": chat_request.system_prompt or DEFAULT_SYSTEM_PROMPT,
+        }
+    ]
+
+    if chat_request.include_search:
+        messages.append(
+            {
+                "role": "system",
+                "content": f"Web search context:\n{build_search_context(search_results)}",
+            }
+        )
+
+    messages.extend(base_messages)
+    return messages
+
+
 async def fetch_searxng_results(query: str, max_results: int) -> list[dict[str, Any]]:
     cache_key = (query, max_results)
     if cache_key in search_cache:
@@ -413,29 +447,71 @@ async def fetch_ollama_models() -> list[dict[str, Any]]:
     return data.get("models", [])
 
 
-async def fetch_ollama_chat_response(
+async def fetch_ollama_chat_request(
     messages: list[dict[str, str]],
     model: str,
     stream: bool,
-) -> dict[str, Any]:
+) -> tuple[aiohttp.ClientSession, aiohttp.ClientResponse]:
     payload = {
         "model": model,
         "messages": messages,
         "stream": stream,
+        "think": False,
     }
 
-    async with aiohttp.ClientSession(timeout=build_timeout()) as session:
+    session = aiohttp.ClientSession(
+        timeout=build_streaming_timeout() if stream else build_timeout()
+    )
+    try:
+        response = await session.post(
+            f"{get_ollama_base_url()}/chat",
+            headers=get_ollama_headers(),
+            json=payload,
+        )
+        response.raise_for_status()
+        return session, response
+    except aiohttp.ClientError as exc:
+        await session.close()
+        logger.error("Ollama chat request failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Failed to fetch model response") from exc
+
+
+async def fetch_ollama_chat_response(
+    messages: list[dict[str, str]],
+    model: str,
+) -> dict[str, Any]:
+    session, response = await fetch_ollama_chat_request(
+        messages=messages,
+        model=model,
+        stream=False,
+    )
+    try:
+        return await response.json()
+    finally:
+        response.release()
+        await session.close()
+
+
+async def create_ollama_chat_stream(
+    messages: list[dict[str, str]],
+    model: str,
+) -> AsyncIterator[bytes]:
+    session, response = await fetch_ollama_chat_request(
+        messages=messages,
+        model=model,
+        stream=True,
+    )
+
+    async def iterator() -> AsyncIterator[bytes]:
         try:
-            async with session.post(
-                f"{get_ollama_base_url()}/chat",
-                headers=get_ollama_headers(),
-                json=payload,
-            ) as response:
-                response.raise_for_status()
-                return await response.json()
-        except aiohttp.ClientError as exc:
-            logger.error("Ollama chat request failed: %s", exc)
-            raise HTTPException(status_code=502, detail="Failed to fetch model response") from exc
+            async for chunk in response.content.iter_any():
+                if chunk:
+                    yield chunk
+        finally:
+            response.release()
+            await session.close()
+
+    return iterator()
 
 
 @app.get("/health")
@@ -459,44 +535,35 @@ async def list_models() -> dict[str, Any]:
 
 
 @app.post("/api/")
-async def get_response(chat_request: ChatRequest) -> dict[str, Any]:
-    if chat_request.stream:
-        raise HTTPException(
-            status_code=400,
-            detail="Streaming responses are not implemented for this endpoint",
-        )
-
+async def get_response(chat_request: ChatRequest) -> Any:
     user_query = resolve_user_query(chat_request)
     base_messages = resolve_messages(chat_request)
     search_results: list[dict[str, Any]] = []
+    requested_model = chat_request.model or get_default_ollama_model()
 
     if chat_request.include_search:
         search_results = await fetch_searxng_results(user_query, chat_request.max_results)
 
-    messages = [
-        {
-            "role": "system",
-            "content": chat_request.system_prompt or DEFAULT_SYSTEM_PROMPT,
-        }
-    ]
+    messages = build_chat_messages(chat_request, base_messages, search_results)
 
-    if chat_request.include_search:
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "Web search context:\n"
-                    f"{build_search_context(search_results)}"
-                ),
-            }
+    if chat_request.stream:
+        stream_iterator = await create_ollama_chat_stream(
+            messages=messages,
+            model=requested_model,
         )
-
-    messages.extend(base_messages)
+        return StreamingResponse(
+            stream_iterator,
+            media_type="application/x-ndjson",
+            headers={
+                "Cache-Control": "no-store",
+                "X-QueryMind-Model": requested_model,
+                "X-QueryMind-Search-Results-Count": str(len(search_results)),
+            },
+        )
 
     response_data = await fetch_ollama_chat_response(
         messages=messages,
-        model=chat_request.model or get_default_ollama_model(),
-        stream=False,
+        model=requested_model,
     )
 
     assistant_message = response_data.get("message", {})

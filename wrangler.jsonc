@@ -1,12 +1,14 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "querymind-api",
+  "account_id": "db9d3872d11d57f6180f22fe83e7f3f7",
   "main": "src/worker.js",
   "compatibility_date": "2026-03-27",
   "compatibility_flags": ["global_fetch_strictly_public"],
   "vars": {
     "OLLAMA_BASE_URL": "https://ollama.com/api",
     "OLLAMA_MODEL": "glm-5",
+    "OLLAMA_PLAN": "free",
     "SEARXNG_DISCOVERY_URL": "https://searx.space/data/instances.json",
     "SEARXNG_ENABLE_FALLBACK_ROTATION": "true",
     "SEARXNG_LANGUAGE": "en",

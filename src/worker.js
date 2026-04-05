@@ -1,3 +1,5 @@
+import { appCss, appJs, indexHtml } from "./ui.js";
+
 const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful, accurate assistant. Use the provided web search context when it is relevant, and mention source URLs when you rely on that context.";
 
@@ -28,6 +30,7 @@ const corsHeaders = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,OPTIONS",
   "access-control-allow-headers": "Content-Type, Authorization",
+  "access-control-expose-headers": "Content-Type, X-QueryMind-Model, X-QueryMind-Search-Results-Count",
 };
 
 function json(data, status = 200) {
@@ -36,6 +39,15 @@ function json(data, status = 200) {
     headers: {
       "content-type": "application/json; charset=utf-8",
       ...corsHeaders,
+    },
+  });
+}
+
+function asset(body, contentType, cacheControl = "public, max-age=300") {
+  return new Response(body, {
+    headers: {
+      "content-type": `${contentType}; charset=utf-8`,
+      "cache-control": cacheControl,
     },
   });
 }
@@ -122,6 +134,15 @@ function parsePositiveFloat(value, fallback) {
   const parsed = Number.parseFloat(value);
   if (Number.isNaN(parsed) || parsed < 0) {
     return fallback;
+  }
+
+  return parsed;
+}
+
+function parseNullablePositiveNumber(value) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return null;
   }
 
   return parsed;
@@ -263,6 +284,64 @@ function resolveMessages(payload) {
   }
 
   return [{ role: "user", content: resolveUserQuery(payload) }];
+}
+
+function buildChatMessages(payload, baseMessages, searchResults) {
+  const messages = [
+    {
+      role: "system",
+      content: payload?.system_prompt || DEFAULT_SYSTEM_PROMPT,
+    },
+  ];
+
+  if (payload?.include_search !== false) {
+    messages.push({
+      role: "system",
+      content: `Web search context:\n${buildSearchContext(searchResults)}`,
+    });
+  }
+
+  messages.push(...baseMessages);
+  return messages;
+}
+
+function extractUsageMetrics(data) {
+  const promptTokens = Number(data?.prompt_eval_count || 0);
+  const completionTokens = Number(data?.eval_count || 0);
+  const totalDurationNs = Number(data?.total_duration || 0);
+
+  return {
+    prompt_tokens: promptTokens,
+    completion_tokens: completionTokens,
+    total_tokens: promptTokens + completionTokens,
+    total_duration_ns: totalDurationNs,
+  };
+}
+
+function buildUsageMetadata(env) {
+  const plan = String(env.OLLAMA_PLAN || "free").toLowerCase();
+  const concurrencyLimit = {
+    free: 1,
+    pro: 3,
+    max: 10,
+  }[plan] || null;
+
+  return {
+    provider: "ollama-cloud",
+    plan,
+    default_model: env.OLLAMA_MODEL || "",
+    exact_remaining_supported: false,
+    billing_model: "provider-compute",
+    session_window_hours: 5,
+    weekly_window_days: 7,
+    concurrency_limit: concurrencyLimit,
+    estimated_session_token_budget: parseNullablePositiveNumber(env.OLLAMA_ESTIMATED_SESSION_TOKEN_BUDGET),
+    estimated_weekly_token_budget: parseNullablePositiveNumber(env.OLLAMA_ESTIMATED_WEEKLY_TOKEN_BUDGET),
+    estimated_session_runtime_budget_ns: parseNullablePositiveNumber(env.OLLAMA_ESTIMATED_SESSION_RUNTIME_BUDGET_NS),
+    estimated_weekly_runtime_budget_ns: parseNullablePositiveNumber(env.OLLAMA_ESTIMATED_WEEKLY_RUNTIME_BUDGET_NS),
+    note:
+      "QueryMind tracks rolling local usage over the last 5 hours and 7 days. Ollama's public API does not expose exact remaining quota or provider reset timestamps.",
+  };
 }
 
 function sanitizeSearchResult(item) {
@@ -464,25 +543,36 @@ async function fetchOllamaModels(env) {
   }
 }
 
-async function fetchOllamaChat(messages, model, env) {
+async function fetchOllamaChatRequest(messages, model, stream, env) {
   const url = `${normalizeOllamaBaseUrl(env.OLLAMA_BASE_URL)}/chat`;
 
   try {
-    return await fetchJson(url, {
+    const response = await fetch(url, {
       method: "POST",
       headers: getOllamaHeaders(env),
       body: JSON.stringify({
         model,
         messages,
-        stream: false,
+        stream,
+        think: false,
       }),
     });
+    if (!response.ok) {
+      const detail = (await response.text()) || `Upstream request failed with status ${response.status}`;
+      throw new HttpError(502, `Ollama chat request failed: ${detail}`);
+    }
+    return response;
   } catch (error) {
     if (error instanceof HttpError) {
-      throw new HttpError(502, `Ollama chat request failed: ${error.message}`);
+      throw error;
     }
-    throw error;
+    throw new HttpError(502, `Ollama chat request failed: ${error.message}`);
   }
+}
+
+async function fetchOllamaChat(messages, model, env) {
+  const response = await fetchOllamaChatRequest(messages, model, false, env);
+  return response.json();
 }
 
 async function parseJsonBody(request) {
@@ -510,6 +600,18 @@ export default {
         return json({ status: "ok" });
       }
 
+      if (request.method === "GET" && path === "/") {
+        return asset(indexHtml, "text/html", "no-store");
+      }
+
+      if (request.method === "GET" && path === "/app.css") {
+        return asset(appCss, "text/css");
+      }
+
+      if (request.method === "GET" && path === "/app.js") {
+        return asset(appJs, "text/javascript");
+      }
+
       if (request.method === "GET" && path === "/search") {
         const query = url.searchParams.get("query");
         if (!query) {
@@ -529,15 +631,17 @@ export default {
         return json({ models });
       }
 
+      if (request.method === "GET" && path === "/usage") {
+        return json(buildUsageMetadata(env));
+      }
+
       if (request.method === "POST" && path === "/api") {
         const payload = await parseJsonBody(request);
-        if (payload?.stream) {
-          throw new HttpError(400, "Streaming responses are not implemented for this endpoint");
-        }
 
         const userQuery = resolveUserQuery(payload || {});
         const baseMessages = resolveMessages(payload || {});
         const includeSearch = payload?.include_search !== false;
+        const requestedModel = payload?.model || getDefaultModel(env);
         const maxResults = parsePositiveInt(
           payload?.max_results,
           parsePositiveInt(env.SEARCH_RESULT_LIMIT, DEFAULT_SEARCH_LIMIT),
@@ -548,25 +652,30 @@ export default {
           searchResults = await fetchSearxResults(userQuery, maxResults, env);
         }
 
-        const messages = [
-          {
-            role: "system",
-            content: payload?.system_prompt || DEFAULT_SYSTEM_PROMPT,
-          },
-        ];
+        const messages = buildChatMessages(payload, baseMessages, searchResults);
 
-        if (includeSearch) {
-          messages.push({
-            role: "system",
-            content: `Web search context:\n${buildSearchContext(searchResults)}`,
+        if (payload?.stream) {
+          const upstreamResponse = await fetchOllamaChatRequest(
+            messages,
+            requestedModel,
+            true,
+            env,
+          );
+          return new Response(upstreamResponse.body, {
+            status: upstreamResponse.status,
+            headers: {
+              ...corsHeaders,
+              "cache-control": "no-store",
+              "content-type": "application/x-ndjson; charset=utf-8",
+              "x-querymind-model": requestedModel,
+              "x-querymind-search-results-count": String(searchResults.length),
+            },
           });
         }
 
-        messages.push(...baseMessages);
-
         const responseData = await fetchOllamaChat(
           messages,
-          payload?.model || getDefaultModel(env),
+          requestedModel,
           env,
         );
 
@@ -574,6 +683,7 @@ export default {
           content: responseData?.message?.content || "",
           model: responseData?.model || payload?.model || null,
           search_results: searchResults,
+          usage: extractUsageMetrics(responseData),
         });
       }
 
